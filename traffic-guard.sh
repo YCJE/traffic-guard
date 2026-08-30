@@ -5,16 +5,20 @@
 # 按计费口径（上下行取最大值 / 仅上行 / 仅下行 / 双向总和）监控周期流量，
 # 达到预警阈值发送通知，达到触发阈值自动关机，防止超出服务商流量额度被扣费。
 #
-# 用法: traffic-guard.sh {install|status|check [--dry-run]|test-notify|uninstall|help}
+# 用法: traffic-guard {install|menu|status|check [--dry-run]|test-notify|upgrade|uninstall|help}
+# 直接输入 traffic-guard 进入交互式管理菜单（类似 x-ui 面板）。
+#
+# 一键安装: bash <(curl -fsSL https://raw.githubusercontent.com/YCJE/traffic-guard/main/install.sh)
 #
 # 适用环境: Linux VPS，root 权限；systemd 优先，无 systemd 自动退回 cron。
 # 统计后端: vnstat 2.x（推荐，重启不丢计数）或 /proc/net/dev + 持久状态文件。
 
 set -o pipefail
 
-VERSION="1.0.0"
-SCRIPT_NAME="traffic-guard.sh"
-INSTALL_PATH="/usr/local/bin/traffic-guard.sh"
+VERSION="1.1.0"
+SCRIPT_NAME="traffic-guard"
+INSTALL_PATH="/usr/local/bin/traffic-guard"
+LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
 CONFIG_FILE="${TRAFFIC_GUARD_CONFIG:-/etc/traffic-guard.conf}"
 STATE_DIR="/var/lib/traffic-guard"
 STATE_FILE="$STATE_DIR/proc-state"
@@ -498,9 +502,172 @@ do_uninstall() {
         rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.timer"
         systemctl daemon-reload 2>/dev/null || true
     fi
-    rm -f "/etc/cron.d/${SERVICE_NAME}" "$INSTALL_PATH"
-    echo "已卸载定时任务与脚本副本。"
+    rm -f "/etc/cron.d/${SERVICE_NAME}" "/etc/cron.d/${SERVICE_NAME}.stopped" \
+          "$INSTALL_PATH" "$LEGACY_PATH"
+    echo "已卸载定时任务与脚本。"
     echo "配置与历史数据已保留（$CONFIG_FILE、$STATE_DIR），如需彻底清理请手动删除。"
+}
+
+# ---------------------------------------------------------------- 升级
+
+do_upgrade() {
+    need_root
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+        || die "升级需要 curl 或 wget，请先安装"
+    local url="${TG_RAW_URL:-https://raw.githubusercontent.com/YCJE/traffic-guard/main/traffic-guard.sh}"
+    local tmp="$INSTALL_PATH.new" newver
+    echo "正在获取最新版本: $url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -m 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "下载失败，请检查网络后重试"; }
+    else
+        wget -qO "$tmp" "$url" || { rm -f "$tmp"; die "下载失败，请检查网络后重试"; }
+    fi
+    bash -n "$tmp" || { rm -f "$tmp"; die "下载脚本语法校验失败，已放弃升级"; }
+    newver=$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$INSTALL_PATH"   # 原子替换，不影响正在运行的实例
+    rm -f "$LEGACY_PATH"
+    echo "✔ 升级完成: ${VERSION} -> ${newver:-unknown}（下次运行生效）"
+    # 重新生成定时任务，确保 ExecStart 指向当前路径
+    if load_config; then
+        install_scheduler >/dev/null 2>&1
+    fi
+}
+
+# ---------------------------------------------------------------- 定时监控控制
+
+monitor_state() {
+    if [ -d /run/systemd/system ]; then
+        systemctl is-active "${SERVICE_NAME}.timer" 2>/dev/null || echo inactive
+    else
+        if [ -f "/etc/cron.d/${SERVICE_NAME}" ]; then echo active
+        elif [ -f "/etc/cron.d/${SERVICE_NAME}.stopped" ]; then echo stopped
+        else echo "not-installed"; fi
+    fi
+}
+
+service_control_menu() {
+    while :; do
+        echo
+        echo "定时监控当前状态: $(monitor_state)"
+        echo "  1. 启动监控"
+        echo "  2. 停止监控"
+        echo "  3. 重启监控"
+        echo "  4. 查看详细状态"
+        echo "  0. 返回上级菜单"
+        local c
+        read -rp "请选择: " c
+        case "$c" in
+            1)
+                if [ -d /run/systemd/system ]; then
+                    systemctl start "${SERVICE_NAME}.timer" 2>/dev/null
+                else
+                    mv -f "/etc/cron.d/${SERVICE_NAME}.stopped" "/etc/cron.d/${SERVICE_NAME}" 2>/dev/null
+                fi
+                echo "✔ 已启动（当前状态: $(monitor_state)）" ;;
+            2)
+                if [ -d /run/systemd/system ]; then
+                    systemctl stop "${SERVICE_NAME}.timer" 2>/dev/null
+                else
+                    mv -f "/etc/cron.d/${SERVICE_NAME}" "/etc/cron.d/${SERVICE_NAME}.stopped" 2>/dev/null
+                fi
+                echo "✔ 已停止（当前状态: $(monitor_state)）" ;;
+            3)
+                if [ -d /run/systemd/system ]; then
+                    systemctl restart "${SERVICE_NAME}.timer" 2>/dev/null
+                    echo "✔ 已重启（当前状态: $(monitor_state)）"
+                else
+                    echo "cron 模式无需重启"
+                fi ;;
+            4)
+                if [ -d /run/systemd/system ]; then
+                    systemctl status "${SERVICE_NAME}.timer" --no-pager -l
+                else
+                    echo "cron 文件: /etc/cron.d/${SERVICE_NAME}"
+                    cat "/etc/cron.d/${SERVICE_NAME}" 2>/dev/null
+                fi ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- 菜单辅助
+
+pause_back() {
+    read -rp "按回车返回菜单..." _
+}
+
+edit_config_menu() {
+    local editor="${EDITOR:-}"
+    if [ -z "$editor" ]; then
+        if command -v nano >/dev/null 2>&1; then editor=nano; else editor=vi; fi
+    fi
+    "$editor" "$CONFIG_FILE"
+    if ( load_config ) 2>/dev/null; then
+        echo "✔ 配置有效"
+    else
+        echo "✘ 配置有误（错误信息见上），请重新编辑修正！"
+    fi
+}
+
+view_logs_menu() {
+    echo "最近 30 条 traffic-guard 日志:"
+    if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        journalctl -t "$SERVICE_NAME" -n 30 --no-pager 2>/dev/null
+    else
+        grep -h "$SERVICE_NAME" /var/log/syslog /var/log/messages 2>/dev/null | tail -n 30
+    fi
+}
+
+# ---------------------------------------------------------------- 交互菜单
+
+show_menu() {
+    need_root
+    while :; do
+        if [ ! -r "$CONFIG_FILE" ]; then
+            echo "尚未安装 traffic-guard（未找到配置文件 $CONFIG_FILE）。"
+            local yn
+            read -rp "现在执行安装向导? [y/n]: " yn
+            case "$yn" in
+                n|N) return ;;
+                *) do_install || return ;;
+            esac
+        fi
+        echo
+        echo "─────── traffic-guard 管理面板 v$VERSION ───────"
+        echo "  1. 查看当前用量与状态"
+        echo "  2. 演练检查（dry-run，不会关机）"
+        echo "  3. 立即检查（真实执行，可能触发自动关机！）"
+        echo "  4. 测试通知"
+        echo "  5. 编辑配置"
+        echo "  6. 查看最近日志"
+        echo "  7. 定时监控 启动/停止/重启"
+        echo "  8. 升级到最新版"
+        echo "  9. 卸载 traffic-guard"
+        echo "  0. 退出"
+        echo "────────────────────────────────────────"
+        local c
+        read -rp "请选择: " c
+        case "$c" in
+            1) ( do_status ); pause_back ;;
+            2) ( do_check --dry-run ); pause_back ;;
+            3)
+                local yn
+                read -rp "将真实执行检查并可能触发自动关机，确认? [y/N]: " yn
+                case "$yn" in y|Y) ( do_check ) ;; *) echo "已取消" ;; esac
+                pause_back ;;
+            4) ( do_test_notify ); pause_back ;;
+            5) edit_config_menu; pause_back ;;
+            6) view_logs_menu; pause_back ;;
+            7) service_control_menu ;;
+            8) do_upgrade; pause_back ;;
+            9)
+                local yn
+                read -rp "确认卸载 traffic-guard? [y/N]: " yn
+                case "$yn" in y|Y) do_uninstall; return ;; *) echo "已取消" ;; esac ;;
+            0|q|Q) return ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------- 安装向导
@@ -768,6 +935,7 @@ EOF
     if [ "$self" != "$INSTALL_PATH" ]; then
         cp -f "$self" "$INSTALL_PATH" && chmod 755 "$INSTALL_PATH"
     fi
+    rm -f "$LEGACY_PATH"
     install_scheduler
 
     # 通知自检
@@ -783,9 +951,11 @@ EOF
 
     echo
     echo "✔ 安装完成！常用命令:"
+    echo "    traffic-guard                   打开交互式管理菜单（推荐）"
     echo "    traffic-guard status            查看当前用量（可与服务商面板对账）"
     echo "    traffic-guard check --dry-run   演练检查（不会真的关机）"
     echo "    traffic-guard test-notify       重发测试通知"
+    echo "    traffic-guard upgrade           在线升级"
     echo "    traffic-guard uninstall         卸载"
     echo
     echo "建议先跑一天 dry-run 并与服务商面板对账，确认口径后再放心使用。"
@@ -793,14 +963,16 @@ EOF
 
 usage() {
     cat <<EOF
-traffic-guard.sh v$VERSION — VPS 流量守护（按计费口径监控流量，超限自动关机）
+traffic-guard v$VERSION — VPS 流量守护（按计费口径监控流量，超限自动关机）
 
 用法:
+  $SCRIPT_NAME                      打开交互式管理菜单
   $SCRIPT_NAME install              交互式安装（配置 + 依赖 + 定时任务）
   $SCRIPT_NAME status               查看当前周期用量
   $SCRIPT_NAME check [--dry-run]    执行检查（定时任务调用；--dry-run 演练不关机）
   $SCRIPT_NAME test-notify          发送测试通知
-  $SCRIPT_NAME uninstall            卸载定时任务与脚本副本
+  $SCRIPT_NAME upgrade              升级到 GitHub 最新版
+  $SCRIPT_NAME uninstall            卸载定时任务与脚本
   $SCRIPT_NAME help                 显示本帮助
 EOF
 }
@@ -808,16 +980,24 @@ EOF
 main() {
     case "${1:-}" in
         install)     shift; do_install "$@" ;;
+        menu)        show_menu ;;
         status)      do_status ;;
         check)       shift; do_check "$@" ;;
         test-notify) do_test_notify ;;
+        upgrade)     do_upgrade ;;
         uninstall)   do_uninstall ;;
-        -h|--help|help|"") usage ;;
+        -h|--help|help) usage ;;
+        "")          usage ;;
         *) usage; die "未知命令: $1" ;;
     esac
 }
 
 # 供单元测试 source（TRAFFIC_GUARD_NO_MAIN=1 时跳过执行）
 if [ -z "${TRAFFIC_GUARD_NO_MAIN:-}" ]; then
-    main "$@"
+    # 无参数且在终端中运行 -> 进入管理菜单（x-ui 风格）；否则按子命令分发
+    if [ "$#" -eq 0 ] && [ -t 0 ]; then
+        show_menu
+    else
+        main "$@"
+    fi
 fi

@@ -16,15 +16,13 @@
 
 ## 快速开始
 
-在 VPS 上以 root 执行：
+在 VPS 上以 root 执行**一条命令**即可完成下载与安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YCJE/traffic-guard/main/traffic-guard.sh -o traffic-guard.sh
-chmod +x traffic-guard.sh
-sudo ./traffic-guard.sh install
+bash <(curl -fsSL https://raw.githubusercontent.com/YCJE/traffic-guard/main/install.sh)
 ```
 
-> 向导需要交互输入，请先下载再运行，不要 `curl | bash`。
+> 没有 curl 就把 `curl -fsSL` 换成 `wget -qO-`。向导需要交互输入，请直接在 SSH 终端运行。
 
 向导会依次询问：
 
@@ -40,18 +38,38 @@ sudo ./traffic-guard.sh install
 | 检查间隔 (秒) | 60 | systemd 生效；cron 模式固定 60 秒 |
 | 通知方式 | 不通知 | 按需选择并填入 token/key，装完自动发测试消息 |
 
-安装完成后，脚本本体复制到 `/usr/local/bin/traffic-guard.sh`，配置写入 `/etc/traffic-guard.conf`（权限 600），定时任务自动注册（systemd timer 优先，无 systemd 退回 cron，每 60 秒检查一次）。
+安装完成后，主脚本位于 `/usr/local/bin/traffic-guard`，配置写入 `/etc/traffic-guard.conf`（权限 600），定时任务自动注册（systemd timer 优先，无 systemd 退回 cron，每 60 秒检查一次）。以后随时输入 `traffic-guard` 进入管理菜单。
+
+## 管理菜单
+
+安装完成后直接输入 `traffic-guard`（等同 `sudo traffic-guard menu`），像 x-ui 一样弹出交互式菜单：
+
+```
+─────── traffic-guard 管理面板 v1.1.0 ───────
+  1. 查看当前用量与状态
+  2. 演练检查（dry-run，不会关机）
+  3. 立即检查（真实执行，可能触发自动关机！）
+  4. 测试通知
+  5. 编辑配置
+  6. 查看最近日志
+  7. 定时监控 启动/停止/重启
+  8. 升级到最新版
+  9. 卸载 traffic-guard
+  0. 退出
+```
 
 ## 命令一览
 
 | 命令 | 作用 |
 |---|---|
-| `traffic-guard install` | 交互式安装（可重复运行修改配置） |
+| `traffic-guard` | 打开交互式管理菜单 |
+| `traffic-guard install` | 交互式安装 / 重新配置 |
 | `traffic-guard status` | 查看当前周期用量、阈值、剩余额度 |
 | `traffic-guard check` | 执行检查（由定时任务自动调用） |
 | `traffic-guard check --dry-run` | 演练检查：只记录日志，不通知不关机 |
 | `traffic-guard test-notify` | 发送测试通知 |
-| `traffic-guard uninstall` | 卸载定时任务与脚本副本（配置保留） |
+| `traffic-guard upgrade` | 在线升级到 GitHub 最新版（配置与数据保留） |
+| `traffic-guard uninstall` | 卸载定时任务与脚本（配置保留） |
 
 ## 工作原理
 
@@ -69,6 +87,10 @@ sudo ./traffic-guard.sh install
 **Q: 服务商面板显示的用量和 `status` 不一样？**
 
 服务商在边缘节点统计，通常略高于系统统计，这正是留「安全缓冲」的原因。跑一两天对比一下：面板明显更高就把 `BUFFER_GB` 调大（编辑 `/etc/traffic-guard.conf` 或重跑 `install`）。
+
+**Q: 如何升级到新版本？**
+
+输入 `traffic-guard` 选菜单 8，或直接 `traffic-guard upgrade`。脚本从 GitHub 拉取最新版并校验语法后替换，配置文件、统计数据和定时任务全部保留。自建镜像可设置环境变量 `TG_RAW_URL` 指向你的下载地址。
 
 **Q: 被自动关机后怎么办？**
 
