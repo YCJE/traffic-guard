@@ -6,13 +6,15 @@
 
 ## 功能特性
 
+- **一键安装**：`bash <(curl -fsSL ...)` 一条命令完成下载、安装并进入配置向导
 - **四种计费口径**：上下行取最大值 / 仅上行 / 仅下行 / 双向总和，安装时选择
 - **周期自动推算**：自定义每月重置日（1-31 号，29/30/31 在小月自动按月末处理），跨周期自动清零
 - **重启不丢计数**：优先使用 vnstat 持久化统计；无法安装时自动降级为 `/proc/net/dev` + 状态文件方案（通过 boot_id 检测重启并累计）
 - **两级阈值**：预警阈值（推送提醒，每日最多一次）+ 触发阈值（自动关机，通知先行）
 - **多种通知渠道**：Telegram Bot / Server酱（微信）/ Bark（iOS）/ 自定义命令，可不通知
+- **管理菜单**：安装后输入 `traffic-guard` 弹出交互式菜单（x-ui 风格），查看状态、启停监控、编辑配置一站搞定
+- **在线升级**：`traffic-guard upgrade` 从 GitHub 拉取最新版自动替换，配置与统计数据保留
 - **演练模式**：`check --dry-run` 完整走一遍检查逻辑但不真的关机
-- **零手工配置**：一条命令交互式向导，全部参数都有默认值
 
 ## 快速开始
 
@@ -23,6 +25,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/YCJE/traffic-guard/main/inst
 ```
 
 > 没有 curl 就把 `curl -fsSL` 换成 `wget -qO-`。向导需要交互输入，请直接在 SSH 终端运行。
+
+**手动安装（备选）**：如果偏好先看脚本再执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YCJE/traffic-guard/main/traffic-guard.sh -o traffic-guard.sh
+chmod +x traffic-guard.sh
+sudo ./traffic-guard.sh install
+```
 
 向导会依次询问：
 
