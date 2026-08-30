@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -150,12 +150,31 @@ resolve_backend() {
 
 # ---------------------------------------------------------------- vnstat 后端
 
-# vnstat_field <网卡> <起始日期> <rx|tx> —— 输出周期内累计字节数，失败返回 1
+# vnstat_field <网卡> <起始日期> <rx|tx> —— 输出周期内累计字节数。
+# 刚安装后 vnstat 尚未写入首份数据（默认保存间隔最长约 5 分钟）、或网卡未加入
+# 数据库时，查询会报错；这两种情况按 0 处理并设置提示 VNSTAT_NOTE，不视为致命错误。
+# VNSTAT_NOTE: 1=暂无数据  2=网卡未入库  3=数据库读取异常
 vnstat_field() {
     local iface="$1" start="$2" field="$3" j out
-    j=$(vnstat -i "$iface" --json d -b "$start" 2>/dev/null) \
-        || j=$(vnstat -i "$iface" --json d 2>/dev/null) \
-        || return 1
+    j=$(vnstat -i "$iface" --json d -b "$start" 2>&1)
+    if [ $? -ne 0 ]; then
+        case "$j" in
+            *"Not enough data"*|*"not enough data"*)
+                [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=1
+                echo 0; return 0 ;;
+            *"nable to find interface"*|*"o such interface"*|*"ot found"*)
+                VNSTAT_NOTE=2
+                echo 0; return 0 ;;
+            *atabase*)
+                [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=3
+                echo 0; return 0 ;;
+        esac
+        # -b 参数可能不被支持，去掉日期参数重试
+        j=$(vnstat -i "$iface" --json d 2>/dev/null) || {
+            [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=1
+            echo 0; return 0
+        }
+    fi
     out=$(printf '%s' "$j" | jq -r --arg start "$start" --arg f "$field" '
         def dstr: (.date.year|tostring) + "-"
                 + ((.date.month|tostring)|if length < 2 then "0" + . else . end) + "-"
@@ -168,23 +187,32 @@ vnstat_field() {
     echo "$out"
 }
 
-# vnstat_usage <起始日期> —— 输出 "rx tx"，失败返回 1
+# vnstat_usage <起始日期> —— 成功时设置全局 RX/TX 并返回 0（直接调用，勿放子 shell，
+# 以便 VNSTAT_NOTE 提示能带回调用方）
 vnstat_usage() {
-    local start="$1" rx=0 tx=0 r t any=0 ifc
+    local start="$1" r t any=0 ifc
     local ifaces=()
     if [ "$INTERFACE" = "ALL" ]; then
-        mapfile -t ifaces < <(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+        # 优先汇总已入库的网卡；拿不到列表时退回所有非 lo 网卡
+        local present
+        present=$(vnstat --dbiflist 2>/dev/null || true)
+        if [ -n "$present" ]; then
+            mapfile -t ifaces < <(printf '%s\n' $present | while read -r i; do
+                iface_exists "$i" 2>/dev/null && echo "$i"
+            done)
+        fi
+        [ "${#ifaces[@]}" -gt 0 ] || mapfile -t ifaces < <(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
         [ "${#ifaces[@]}" -gt 0 ] || return 1
     else
         ifaces=("$INTERFACE")
     fi
     for ifc in "${ifaces[@]}"; do
-        r=$(vnstat_field "$ifc" "$start" rx) || continue
-        t=$(vnstat_field "$ifc" "$start" tx) || continue
-        rx=$((rx + r)); tx=$((tx + t)); any=1
+        if r=$(vnstat_field "$ifc" "$start" rx) && t=$(vnstat_field "$ifc" "$start" tx); then
+            RX=$((RX + r)); TX=$((TX + t)); any=1
+        fi
     done
     [ "$any" -eq 1 ] || return 1
-    echo "$rx $tx"
+    return 0
 }
 
 # ---------------------------------------------------------------- proc 后端
@@ -288,19 +316,33 @@ initial_bytes_for() {
     echo "$init"
 }
 
-# collect_usage <后端> <起始日期> —— 设置全局 RX / TX / USED，失败返回 1
+# collect_usage <后端> <起始日期> —— 设置全局 RX / TX / USED，失败返回 1。
+# VNSTAT_NOTE 为空表示数据正常，非空时携带提示编号（1/2/3）。
 collect_usage() {
-    local backend="$1" start="$2" out rx tx used
+    local backend="$1" start="$2" rx=0 tx=0 used out
+    VNSTAT_NOTE=""
     if [ "$backend" = "vnstat" ]; then
-        out=$(vnstat_usage "$start") || return 1
+        RX=0; TX=0
+        vnstat_usage "$start" || return 1
+        rx=$RX; tx=$TX
     else
         out=$(proc_usage "$start") || return 1
+        read -r rx tx <<<"$out"
+        case "$rx$tx" in ''|*[!0-9]*) return 1 ;; esac
     fi
-    read -r rx tx <<<"$out"
-    case "$rx$tx" in ''|*[!0-9]*) return 1 ;; esac
     used=$(( $(apply_mode "$rx" "$tx") + $(initial_bytes_for "$start") ))
     RX=$rx; TX=$tx; USED=$used
     return 0
+}
+
+# vnstat_note_text —— 把 VNSTAT_NOTE 编号转成人类可读提示
+vnstat_note_text() {
+    case "$VNSTAT_NOTE" in
+        1) echo "vnstat 本周期暂无数据：刚安装后几分钟内属正常（首次写入最长约 5 分钟），随后自动开始累计" ;;
+        2) echo "网卡 $INTERFACE 未加入 vnstat 数据库，统计将一直为 0！修复: sudo vnstat --add -i $INTERFACE（或重新运行 traffic-guard install）" ;;
+        3) echo "vnstat 数据库读取异常，建议检查 vnstat 服务状态，或将配置中 BACKEND 改为 \"proc\"" ;;
+        *) echo "" ;;
+    esac
 }
 
 # ---------------------------------------------------------------- 通知
@@ -390,7 +432,8 @@ do_status() {
     start=$(cycle_start)
     collect_usage "$backend" "$start" || {
         echo "无法获取流量数据（后端: $backend）。"
-        [ "$backend" = "vnstat" ] && echo "请确认 vnstat/jq 已安装、vnstat 服务正在运行，且网卡已加入 vnstat 数据库。"
+        [ "$backend" = "vnstat" ] && echo "请确认 vnstat/jq 已安装、vnstat 服务正在运行，且网卡已加入 vnstat 数据库（sudo vnstat --add -i $INTERFACE）。"
+        echo "应急方案: 编辑 $CONFIG_FILE，将 BACKEND=\"vnstat\" 改为 BACKEND=\"proc\" 后即可恢复统计。"
         exit 1
     }
     local limit_bytes shut_bytes pct remain_limit remain_shut
@@ -399,6 +442,8 @@ do_status() {
     pct=$(awk -v u="$USED" -v l="$limit_bytes" 'BEGIN { printf "%.1f", u * 100 / l }')
     remain_limit=$(awk -v l="$limit_bytes" -v u="$USED" 'BEGIN { printf "%.2f", (l > u ? l - u : 0) / 1e9 }')
     remain_shut=$(awk -v s="$shut_bytes" -v u="$USED" 'BEGIN { printf "%.2f", (s > u ? s - u : 0) / 1e9 }')
+    local note_line=""
+    [ -n "$VNSTAT_NOTE" ] && note_line="⚠ 注意     : $(vnstat_note_text)"
     cat <<EOF
 ================ traffic-guard 状态 ================
 统计后端    : $backend
@@ -413,6 +458,7 @@ do_status() {
 关机阈值    : $(bytes_to_gb "$shut_bytes") GB（上限 - 缓冲 ${BUFFER_GB} GB）
 剩余可用    : 到上限 $remain_limit GB / 到关机阈值 $remain_shut GB
 通知方式    : $NOTIFY_TYPE
+$note_line
 ====================================================
 提示: 请与服务商面板用量对账；若面板数值明显更高，调大 BUFFER_GB。
 EOF
@@ -445,6 +491,11 @@ do_check() {
 
     log "检查: 周期 $start 已用 $(bytes_to_gb "$USED")GB / ${LIMIT_GB}GB" \
         "(rx=$(bytes_to_gb "$RX") tx=$(bytes_to_gb "$TX") 口径:$(mode_label) 后端:$backend)"
+
+    case "$VNSTAT_NOTE" in
+        2) log "警告: $(vnstat_note_text)" ;;
+        3) log "警告: $(vnstat_note_text)" ;;
+    esac
 
     if [ "$USED" -ge "$shut_bytes" ]; then
         log "已用流量达到触发阈值 $(bytes_to_gb "$shut_bytes")GB，执行保护动作: 关机"
@@ -717,7 +768,12 @@ ensure_vnstat() {
     if command -v vnstat >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
         local major; major=$(vnstat_major)
         if [ -n "$major" ] && [ "$major" -ge 2 ]; then
-            [ -d /run/systemd/system ] && systemctl enable --now vnstat >/dev/null 2>&1 || true
+            if [ -d /run/systemd/system ]; then
+                systemctl enable --now vnstat >/dev/null 2>&1 || true
+                # 确认守护进程真的在跑，没跑就再拉一次
+                systemctl is-active --quiet vnstat 2>/dev/null || \
+                    systemctl restart vnstat >/dev/null 2>&1 || true
+            fi
             return 0
         fi
         echo "检测到 vnstat 版本过旧（$major.x），将使用 proc 后端。"
@@ -726,11 +782,19 @@ ensure_vnstat() {
 }
 
 vnstat_add_iface() {
-    command -v vnstat >/dev/null 2>&1 || return 0
-    local ifc
+    command -v vnstat >/dev/null 2>&1 || return 1
+    local ifc try total=0 added=0
     for ifc in "$@"; do
-        vnstat --add -i "$ifc" >/dev/null 2>&1 || true
+        total=$((total + 1))
+        for try in 1 2 3; do
+            # 失败常见于守护进程刚启动时数据库被占用，等待后重试
+            if vnstat --add -i "$ifc" >/dev/null 2>&1; then added=$((added + 1)); break; fi
+            sleep 2
+        done
     done
+    [ "$added" -eq 0 ] && return 1
+    [ "$added" -ne "$total" ] && echo "  注意: 部分网卡未能加入 vnstat 数据库"
+    return 0
 }
 
 install_scheduler() {
@@ -874,16 +938,22 @@ do_install() {
     # 10. 统计后端
     local backend_note="proc（无需额外依赖）"
     if ensure_vnstat; then
-        backend_note="vnstat（推荐，重启不丢计数）"
         if [ "$iface" = "ALL" ]; then
             vnstat_add_iface $(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
         else
             vnstat_add_iface "$iface"
         fi
+        if [ $? -eq 0 ]; then
+            backend_note="vnstat（推荐，重启不丢计数）"
+            BACKEND=auto
+        else
+            echo "警告: 网卡加入 vnstat 数据库失败，自动改用 proc 后端。"
+            BACKEND=proc
+        fi
     else
         echo "vnstat 不可用，将使用 proc 后端（通过状态文件跨重启累计）。"
+        BACKEND=auto
     fi
-    BACKEND=auto
     local resolved_backend
     resolved_backend=$(resolve_backend)
 
@@ -959,6 +1029,11 @@ EOF
     echo "    traffic-guard uninstall         卸载"
     echo
     echo "建议先跑一天 dry-run 并与服务商面板对账，确认口径后再放心使用。"
+    if [ "$resolved_backend" = "vnstat" ]; then
+        echo
+        echo "提示: vnstat 首次写入数据需要几分钟（默认保存间隔最长约 5 分钟），"
+        echo "      期间 status 用量显示为 0 属正常现象，无需处理。"
+    fi
 }
 
 usage() {
