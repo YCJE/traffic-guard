@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -349,10 +349,15 @@ vnstat_note_text() {
 
 send_notify() {
     local title="$1" body="$2" ok=""
+    # et/eb 为 JSON 转义版；走 curl --data-urlencode 的渠道直接用原文
+    local et eb
+    et=${title//\\/\\\\}; et=${et//\"/\\\"}
+    eb=${body//\\/\\\\};  eb=${eb//\"/\\\"}; eb=${eb//$'\n'/ }
     case "$NOTIFY_TYPE" in
         telegram)
             [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || { log "Telegram 未配置完整，跳过通知"; return 1; }
-            ok=$(curl -sm 8 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            local tg_base="${TG_API_BASE:-https://api.telegram.org}"
+            ok=$(curl -sm 8 "${tg_base}/bot${TG_BOT_TOKEN}/sendMessage" \
                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
                  --data-urlencode "text=${title}
 ${body}" 2>/dev/null) ;;
@@ -364,12 +369,37 @@ ${body}" 2>/dev/null) ;;
         bark)
             [ -n "$BARK_KEY" ] || { log "Bark 未配置，跳过通知"; return 1; }
             local bark_url="${BARK_URL:-https://api.day.app}"
-            local et eb
-            et=${title//\\/\\\\}; et=${et//\"/\\\"}
-            eb=${body//\\/\\\\};  eb=${eb//\"/\\\"}; eb=${eb//$'\n'/ }
             ok=$(curl -sm 8 -H 'Content-Type: application/json; charset=utf-8' \
                  -d "{\"device_key\":\"${BARK_KEY}\",\"title\":\"${et}\",\"body\":\"${eb}\",\"group\":\"traffic-guard\"}" \
                  "${bark_url}/push" 2>/dev/null) ;;
+        wecom)
+            [ -n "$WECOM_KEY" ] || { log "企业微信未配置，跳过通知"; return 1; }
+            ok=$(curl -sm 8 -H 'Content-Type: application/json; charset=utf-8' \
+                 -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${et} ${eb}\"}}" \
+                 "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${WECOM_KEY}" 2>/dev/null) ;;
+        dingtalk)
+            [ -n "$DING_TOKEN" ] || { log "钉钉未配置，跳过通知"; return 1; }
+            local durl="https://oapi.dingtalk.com/robot/send?access_token=${DING_TOKEN}"
+            if [ -n "$DING_SECRET" ]; then
+                if command -v openssl >/dev/null 2>&1; then
+                    local ts sign
+                    ts=$(date +%s%3N 2>/dev/null)
+                    case "$ts" in ''|*[!0-9]*) ts=$(( $(date +%s) * 1000 )) ;; esac
+                    sign=$(printf '%s\n%s' "$ts" "$DING_SECRET" \
+                           | openssl dgst -sha256 -hmac "$DING_SECRET" -binary 2>/dev/null \
+                           | base64 | tr -d '\n')
+                    durl="${durl}&timestamp=${ts}&sign=$(printf '%s' "$sign" | sed 's/+/%2B/g; s|/|%2F|g; s/=/%3D/g')"
+                else
+                    log "警告: 配置了钉钉加签但缺少 openssl，本次按无加签发送（请确认机器人设置了自定义关键词）"
+                fi
+            fi
+            ok=$(curl -sm 8 -H 'Content-Type: application/json; charset=utf-8' \
+                 -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${et} ${eb}\"}}" "$durl" 2>/dev/null) ;;
+        feishu)
+            [ -n "$FEISHU_KEY" ] || { log "飞书未配置，跳过通知"; return 1; }
+            ok=$(curl -sm 8 -H 'Content-Type: application/json; charset=utf-8' \
+                 -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"${et} ${eb}\"}}" \
+                 "https://open.feishu.cn/open-apis/bot/v2/hook/${FEISHU_KEY}" 2>/dev/null) ;;
         custom)
             [ -n "$NOTIFY_CMD" ] || { log "自定义通知命令未配置，跳过"; return 1; }
             bash -c "$NOTIFY_CMD" traffic-guard "$title: $body"
@@ -378,8 +408,8 @@ ${body}" 2>/dev/null) ;;
             return 0 ;;
     esac
     case "$NOTIFY_TYPE" in
-        telegram|serverchan|bark)
-            if printf '%s' "$ok" | grep -qi '"ok"[ ]*:[ ]*true\|"code"[ ]*:[ ]*"?0"?[^0-9]\|"code"[ ]*:[ ]*"?200'; then
+        telegram|serverchan|bark|wecom|dingtalk|feishu)
+            if printf '%s' "$ok" | grep -qi '"ok"[ ]*:[ ]*true\|"errcode"[ ]*:[ ]*0\|"code"[ ]*:[ ]*"?0\|"code"[ ]*:[ ]*"?200\|"StatusCode"[ ]*:[ ]*0'; then
                 log "通知已发送 ($NOTIFY_TYPE)"
                 return 0
             fi
@@ -444,6 +474,19 @@ do_status() {
     remain_shut=$(awk -v s="$shut_bytes" -v u="$USED" 'BEGIN { printf "%.2f", (s > u ? s - u : 0) / 1e9 }')
     local note_line=""
     [ -n "$VNSTAT_NOTE" ] && note_line="⚠ 注意     : $(vnstat_note_text)"
+    local pace_line=""
+    if [ "$USED" -gt 0 ]; then
+        local days_elapsed pace_rate proj_shut
+        days_elapsed=$(( ( $(date +%s) - $(date -d "$start" +%s) ) / 86400 + 1 ))
+        pace_rate=$(awk -v u="$USED" -v d="$days_elapsed" 'BEGIN { printf "%.2f", u / d / 1e9 }')
+        if [ "$USED" -ge "$shut_bytes" ]; then
+            pace_line="用量速度    : 日均 ${pace_rate} GB；已达到关机阈值（估算）"
+        else
+            proj_shut=$(awk -v s="$shut_bytes" -v u="$USED" -v d="$days_elapsed" \
+                'BEGIN { v = (s - u) / (u / d); printf "%d", (v == int(v)) ? v : int(v) + 1 }')
+            pace_line="用量速度    : 日均 ${pace_rate} GB；按此速度预计 $(date -d "+${proj_shut} days" +%m-%d) 到达关机阈值（估算）"
+        fi
+    fi
     cat <<EOF
 ================ traffic-guard 状态 ================
 统计后端    : $backend
@@ -457,6 +500,7 @@ do_status() {
 预警阈值    : $([ "$WARN_GB" -gt 0 ] && echo "${WARN_GB} GB" || echo "未启用")
 关机阈值    : $(bytes_to_gb "$shut_bytes") GB（上限 - 缓冲 ${BUFFER_GB} GB）
 剩余可用    : 到上限 $remain_limit GB / 到关机阈值 $remain_shut GB
+$pace_line
 通知方式    : $NOTIFY_TYPE
 $note_line
 ====================================================
@@ -556,7 +600,18 @@ do_uninstall() {
     rm -f "/etc/cron.d/${SERVICE_NAME}" "/etc/cron.d/${SERVICE_NAME}.stopped" \
           "$INSTALL_PATH" "$LEGACY_PATH"
     echo "已卸载定时任务与脚本。"
-    echo "配置与历史数据已保留（$CONFIG_FILE、$STATE_DIR），如需彻底清理请手动删除。"
+    local yn
+    read -rp "是否同时删除配置与历史数据（$CONFIG_FILE、$STATE_DIR）? [y/N]: " yn
+    case "$yn" in
+        y|Y)
+            rm -rf "$STATE_DIR"
+            rm -f "$CONFIG_FILE"
+            echo "已删除配置与数据。"
+            ;;
+        *)
+            echo "配置与历史数据已保留（$CONFIG_FILE、$STATE_DIR），重装可继续使用。"
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------- 升级
@@ -914,14 +969,19 @@ do_install() {
     echo "  1) Telegram Bot"
     echo "  2) Server酱（微信推送）"
     echo "  3) Bark（iOS 推送）"
-    echo "  4) 自定义命令（消息文本作为 \$1 传入）"
-    local notify_choice notify_type tg_token="" tg_chat="" sc_key="" bark_key="" bark_url="" custom_cmd=""
-    notify_choice=$(ask "请选择 [0-4]" "0")
+    echo "  4) 企业微信群机器人"
+    echo "  5) 钉钉群机器人"
+    echo "  6) 飞书群机器人"
+    echo "  7) 自定义命令（消息文本作为 \$1 传入）"
+    local notify_choice notify_type tg_token="" tg_chat="" tg_api="" sc_key="" bark_key="" bark_url="" wecom_key="" ding_token="" ding_secret="" feishu_key="" custom_cmd=""
+    notify_choice=$(ask "请选择 [0-7]" "0")
     case "$notify_choice" in
         1)
             notify_type=telegram
             tg_token=$(ask "Telegram Bot Token" "")
-            tg_chat=$(ask "Telegram Chat ID" "") ;;
+            tg_chat=$(ask "Telegram Chat ID" "")
+            echo "  （国内服务器收不到推送时，可填 Telegram API 反代地址）"
+            tg_api=$(ask "TG API 地址（官方则回车）" "") ;;
         2)
             notify_type=serverchan
             sc_key=$(ask "Server酱 SendKey" "") ;;
@@ -930,6 +990,16 @@ do_install() {
             bark_key=$(ask "Bark Device Key" "")
             bark_url=$(ask "Bark 服务器地址（官方则回车）" "https://api.day.app") ;;
         4)
+            notify_type=wecom
+            wecom_key=$(ask "企业微信 Webhook Key（机器人地址 key= 后的内容）" "") ;;
+        5)
+            notify_type=dingtalk
+            ding_token=$(ask "钉钉机器人 Access Token" "")
+            ding_secret=$(ask "钉钉加签密钥 SEC 开头（未开启加签则回车）" "") ;;
+        6)
+            notify_type=feishu
+            feishu_key=$(ask "飞书 Webhook Key（hook/ 后的内容）" "") ;;
+        7)
             notify_type=custom
             custom_cmd=$(ask "自定义命令（例如: curl -sm5 https://hook.example --data-urlencode \"msg=\$1\"）" "") ;;
         *) notify_type=none ;;
@@ -978,7 +1048,7 @@ do_install() {
     # 写配置
     mkdir -p "$STATE_DIR"
     ( umask 077; cat > "$CONFIG_FILE" <<EOF
-# /etc/traffic-guard.conf — 由 traffic-guard.sh install 生成
+# /etc/traffic-guard.conf — 由 traffic-guard install 生成
 INTERFACE="$iface"
 LIMIT_GB=$limit
 MODE="$mode"
@@ -990,9 +1060,14 @@ CHECK_INTERVAL=$interval
 NOTIFY_TYPE="$notify_type"
 TG_BOT_TOKEN="$tg_token"
 TG_CHAT_ID="$tg_chat"
+TG_API_BASE="$tg_api"
 SERVERCHAN_KEY="$sc_key"
 BARK_KEY="$bark_key"
 BARK_URL="$bark_url"
+WECOM_KEY="$wecom_key"
+DING_TOKEN="$ding_token"
+DING_SECRET="$ding_secret"
+FEISHU_KEY="$feishu_key"
 NOTIFY_CMD='$custom_cmd'
 BACKEND="$resolved_backend"
 EOF
@@ -1012,8 +1087,10 @@ EOF
     if [ "$notify_type" != "none" ]; then
         echo
         echo "发送测试通知..."
-        NOTIFY_TYPE="$notify_type" TG_BOT_TOKEN="$tg_token" TG_CHAT_ID="$tg_chat" \
-        SERVERCHAN_KEY="$sc_key" BARK_KEY="$bark_key" BARK_URL="$bark_url" NOTIFY_CMD="$custom_cmd" \
+        NOTIFY_TYPE="$notify_type" TG_BOT_TOKEN="$tg_token" TG_CHAT_ID="$tg_chat" TG_API_BASE="$tg_api" \
+        SERVERCHAN_KEY="$sc_key" BARK_KEY="$bark_key" BARK_URL="$bark_url" \
+        WECOM_KEY="$wecom_key" DING_TOKEN="$ding_token" DING_SECRET="$ding_secret" FEISHU_KEY="$feishu_key" \
+        NOTIFY_CMD="$custom_cmd" \
         send_notify "traffic-guard 测试" "安装成功，通知渠道工作正常 ✅" \
             && echo "测试通知已发送，请查收。" \
             || echo "测试通知发送失败，可稍后运行 traffic-guard test-notify 重试。"

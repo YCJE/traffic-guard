@@ -11,7 +11,7 @@
 - **周期自动推算**：自定义每月重置日（1-31 号，29/30/31 在小月自动按月末处理），跨周期自动清零
 - **重启不丢计数**：优先使用 vnstat 持久化统计；无法安装时自动降级为 `/proc/net/dev` + 状态文件方案（通过 boot_id 检测重启并累计）
 - **两级阈值**：预警阈值（推送提醒，每日最多一次）+ 触发阈值（自动关机，通知先行）
-- **多种通知渠道**：Telegram Bot / Server酱（微信）/ Bark（iOS）/ 自定义命令，可不通知
+- **多种通知渠道**：Telegram Bot / Server酱（微信）/ Bark（iOS）/ 企业微信 / 钉钉 / 飞书 / 自定义命令，可不通知；Telegram 支持反代地址，国内服务器也能收
 - **管理菜单**：安装后输入 `traffic-guard` 弹出交互式菜单（x-ui 风格），查看状态、启停监控、编辑配置一站搞定
 - **在线升级**：`traffic-guard upgrade` 从 GitHub 拉取最新版自动替换，配置与统计数据保留
 - **演练模式**：`check --dry-run` 完整走一遍检查逻辑但不真的关机
@@ -55,7 +55,7 @@ sudo ./traffic-guard.sh install
 安装完成后直接输入 `traffic-guard`（等同 `sudo traffic-guard menu`），像 x-ui 一样弹出交互式菜单：
 
 ```
-─────── traffic-guard 管理面板 v1.1.1 ───────
+─────── traffic-guard 管理面板 v1.2.0 ───────
   1. 查看当前用量与状态
   2. 演练检查（dry-run，不会关机）
   3. 立即检查（真实执行，可能触发自动关机！）
@@ -101,6 +101,14 @@ sudo ./traffic-guard.sh install
 **Q: 如何升级到新版本？**
 
 输入 `traffic-guard` 选菜单 8，或直接 `traffic-guard upgrade`。脚本从 GitHub 拉取最新版并校验语法后替换，配置文件、统计数据和定时任务全部保留。自建镜像可设置环境变量 `TG_RAW_URL` 指向你的下载地址。
+
+**Q: 国内服务器收不到 Telegram 推送？**
+
+安装向导选 Telegram 后，把「TG API 地址」填为你的反代地址（如 `https://tg.xxx.com`），脚本会改走该地址发消息；也可以事后编辑配置文件的 `TG_API_BASE`。
+
+**Q: 钉钉机器人一直发送失败？**
+
+钉钉群机器人要求安全设置三选一：自定义关键词（建议填 `traffic`，脚本消息都含 traffic-guard 字样）、加签（把 SEC 开头的密钥填入向导，需系统有 openssl，一般都自带）、IP 白名单。
 
 **Q: 被自动关机后怎么办？**
 
