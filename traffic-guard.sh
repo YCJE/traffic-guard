@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -28,8 +28,10 @@ SERVICE_NAME="traffic-guard"
 
 # ---------------------------------------------------------------- 基础工具
 
+# 日志统一输出到 stderr: 部分调用方处于命令替换 $(...) 中（如 proc_usage），
+# 写 stdout 会混入其返回值导致解析失败
 log() {
-    echo "[$(date '+%F %T')] $*"
+    echo "[$(date '+%F %T')] $*" >&2
     command -v logger >/dev/null 2>&1 && logger -t "$SERVICE_NAME" "$*" 2>/dev/null
     return 0
 }
@@ -50,6 +52,19 @@ gb_to_bytes() {
 
 bytes_to_gb() {
     awk -v b="$1" 'BEGIN { printf "%.2f", b / 1000000000 }'
+}
+
+# 配置文件转义: 用户输入写入 /etc/traffic-guard.conf 前必须转义，
+# 否则含引号/$/反引号的值会破坏配置语法甚至改变语义
+dq_escape() { # 双引号上下文
+    local s=$1
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//\$/\\$}; s=${s//\`/\\\`}
+    printf '%s' "$s"
+}
+sq_escape() { # 单引号上下文
+    local s=$1
+    s=${s//\'/\'\\\'\'}
+    printf '%s' "$s"
 }
 
 # ---------------------------------------------------------------- 周期计算
@@ -235,6 +250,11 @@ proc_raw() {
 # 输出 "rx tx"。状态文件记录 boot_id / 周期 / 累计值 / 上次原值。
 proc_usage() {
     local start="$1"
+    # 与并发的 status/check 互斥，防止状态文件 read-modify-write 丢失更新。
+    # 用独立锁文件（do_check 已持有 .lock，同进程对不同 fd 加锁同一文件会死锁）
+    if command -v flock >/dev/null 2>&1 && mkdir -p "$STATE_DIR" 2>/dev/null; then
+        exec 8>>"$STATE_DIR/.statelock" && flock 8
+    fi
     local raw boot btime ifset start_epoch
     raw=$(proc_raw "$INTERFACE") || return 1
     read -r raw_rx raw_tx <<<"$raw"
@@ -257,6 +277,19 @@ proc_usage() {
                 last_tx) s_last_tx="$v" ;;
             esac
         done < "$STATE_FILE"
+        # 数值字段被破坏（手改/磁盘故障）时按状态缺失处理，
+        # 否则会进入算术表达式报错或产生计数跳变
+        local sf_bad=0
+        for v in "$s_cum_rx" "$s_cum_tx"; do
+            case "$v" in ''|*[!0-9]*) sf_bad=1 ;; esac
+        done
+        if [ "$sf_bad" -eq 0 ] && [ -n "$s_last_rx" ]; then
+            case "$s_last_rx$s_last_tx" in ''|*[!0-9]*) sf_bad=1 ;; esac
+        fi
+        if [ "$sf_bad" -eq 1 ]; then
+            log "警告: 状态文件损坏，proc 后端计数从头累计"
+            s_boot=""; s_cycle=""; s_ifset=""; s_cum_rx=0; s_cum_tx=0; s_last_rx=""; s_last_tx=""
+        fi
     fi
 
     local delta_rx=0 delta_tx=0
@@ -303,17 +336,15 @@ proc_usage() {
 
 # ---------------------------------------------------------------- 用量汇总
 
-# 初始已用量（安装向导填写，仅对写入时的周期生效，跨周期自动失效）
+# 初始已用量: 仅对安装/重装时记录的周期（META_FILE 中的 initial_cycle）生效，
+# 跨周期自动失效。META 由 do_install 写入，查询侧只读、无副作用（本函数会在
+# 命令替换中执行，任何 stdout 之外的输出都会破坏返回值）。
 initial_bytes_for() {
     local init=$(( ${INITIAL_GB:-0} * 1000000000 ))
     [ "$init" -gt 0 ] || { echo 0; return; }
     local ic
     ic=$(sed -n 's/^initial_cycle=//p' "$META_FILE" 2>/dev/null)
-    if [ "$ic" != "$1" ]; then
-        mkdir -p "$STATE_DIR"
-        printf 'initial_cycle=%s\n' "$1" > "$META_FILE.tmp" && mv "$META_FILE.tmp" "$META_FILE"
-    fi
-    echo "$init"
+    [ "$ic" = "$1" ] && echo "$init" || echo 0
 }
 
 # collect_usage <后端> <起始日期> —— 设置全局 RX / TX / USED，失败返回 1。
@@ -439,6 +470,8 @@ load_config() {
     CHECK_INTERVAL=${CHECK_INTERVAL:-60}
     NOTIFY_TYPE=${NOTIFY_TYPE:-none}
     BACKEND=${BACKEND:-auto}
+    # 数值兜底: 非法值不致命，恢复默认后继续（防止垃圾值写入 systemd unit）
+    case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=60 ;; esac
     [ "$CHECK_INTERVAL" -lt 10 ] && CHECK_INTERVAL=10
 
     if [ "$INTERFACE" = "auto" ] || [ -z "$INTERFACE" ]; then
@@ -478,13 +511,18 @@ do_status() {
     if [ "$USED" -gt 0 ]; then
         local days_elapsed pace_rate proj_shut
         days_elapsed=$(( ( $(date +%s) - $(date -d "$start" +%s) ) / 86400 + 1 ))
+        [ "$days_elapsed" -lt 1 ] && days_elapsed=1
         pace_rate=$(awk -v u="$USED" -v d="$days_elapsed" 'BEGIN { printf "%.2f", u / d / 1e9 }')
         if [ "$USED" -ge "$shut_bytes" ]; then
             pace_line="用量速度    : 日均 ${pace_rate} GB；已达到关机阈值（估算）"
         else
             proj_shut=$(awk -v s="$shut_bytes" -v u="$USED" -v d="$days_elapsed" \
                 'BEGIN { v = (s - u) / (u / d); printf "%d", (v == int(v)) ? v : int(v) + 1 }')
-            pace_line="用量速度    : 日均 ${pace_rate} GB；按此速度预计 $(date -d "+${proj_shut} days" +%m-%d) 到达关机阈值（估算）"
+            if [ "$proj_shut" -gt 365 ]; then
+                pace_line="用量速度    : 日均 ${pace_rate} GB；按此速度一年内不会到达关机阈值（估算）"
+            else
+                pace_line="用量速度    : 日均 ${pace_rate} GB；按此速度预计 $(date -d "+${proj_shut} days" +%m-%d) 到达关机阈值（估算）"
+            fi
         fi
     fi
     cat <<EOF
@@ -512,9 +550,10 @@ do_check() {
     local dryrun=0
     [ "${1:-}" = "--dry-run" ] && dryrun=1
     load_config || exit 1
+    # 无条件确保目录存在: 预警/关机的时间戳记录依赖它，缺失会导致每轮重复通知
+    mkdir -p "$STATE_DIR" 2>/dev/null
 
     if command -v flock >/dev/null 2>&1; then
-        mkdir -p "$STATE_DIR"
         exec 9>"$STATE_DIR/.lock"
         flock -n 9 || { log "上一次检查尚未结束，跳过本次"; exit 0; }
     fi
@@ -547,14 +586,24 @@ do_check() {
             log "[dry-run] 演练模式：跳过通知与关机。实际运行将立即关机！"
             return 0
         fi
-        send_notify "traffic-guard 警告" "本周期流量已达 $(bytes_to_gb "$USED")GB（上限 ${LIMIT_GB}GB），VPS 即将自动关机！"
-        sleep 3
-        log "正在关机..."
+        # 关机通知每 60 分钟最多一次: 防止关机命令不生效（如容器缺权限）时每轮检查刷屏
+        local now_ts last_ts stamp_file="$STATE_DIR/last-shutdown-notify"
+        now_ts=$(date +%s)
+        last_ts=$(cat "$stamp_file" 2>/dev/null)
+        case "$last_ts" in ''|*[!0-9]*) last_ts=0 ;; esac
+        if [ $((now_ts - last_ts)) -ge 3600 ]; then
+            send_notify "traffic-guard 警告" "本周期流量已达 $(bytes_to_gb "$USED")GB（上限 ${LIMIT_GB}GB），VPS 即将自动关机！"
+            printf '%s\n' "$now_ts" > "$stamp_file" 2>/dev/null || true
+            sleep 3
+        fi
+        log "正在执行关机命令..."
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl poweroff
         else
             command -v poweroff >/dev/null 2>&1 && poweroff || shutdown -h now
         fi
+        # 能走到这里说明关机命令未生效（如 LXC 容器无 poweroff 权限），留下明确日志
+        log "警告: 关机命令未生效，下轮检查将重试（通知每 60 分钟最多发送一次）"
         return 0
     fi
 
@@ -622,6 +671,7 @@ do_upgrade() {
         || die "升级需要 curl 或 wget，请先安装"
     local url="${TG_RAW_URL:-https://raw.githubusercontent.com/YCJE/traffic-guard/main/traffic-guard.sh}"
     local tmp="$INSTALL_PATH.new" newver
+    mkdir -p "$(dirname "$INSTALL_PATH")" 2>/dev/null
     echo "正在获取最新版本: $url"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL -m 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "下载失败，请检查网络后重试"; }
@@ -907,8 +957,13 @@ do_install() {
     local iface
     while :; do
         iface=$(ask "监控哪个网卡（输入 ALL 统计所有非 lo 网卡）" "$detected")
-        if [ "$iface" = "ALL" ] || iface_exists "$iface"; then break; fi
-        echo "  网卡 $iface 不存在，请重新输入"
+        case "$iface" in
+            ALL) break ;;
+            *[!A-Za-z0-9._-]*)
+                echo "  网卡名含非法字符，请重新输入" ;;
+            *)
+                if iface_exists "$iface"; then break; else echo "  网卡 $iface 不存在，请重新输入"; fi ;;
+        esac
     done
 
     # 2. 计费上限
@@ -1049,7 +1104,7 @@ do_install() {
     mkdir -p "$STATE_DIR"
     ( umask 077; cat > "$CONFIG_FILE" <<EOF
 # /etc/traffic-guard.conf — 由 traffic-guard install 生成
-INTERFACE="$iface"
+INTERFACE="$(dq_escape "$iface")"
 LIMIT_GB=$limit
 MODE="$mode"
 BUFFER_GB=$buffer
@@ -1058,21 +1113,30 @@ RESET_DAY=$reset_day
 INITIAL_GB=$initial
 CHECK_INTERVAL=$interval
 NOTIFY_TYPE="$notify_type"
-TG_BOT_TOKEN="$tg_token"
-TG_CHAT_ID="$tg_chat"
-TG_API_BASE="$tg_api"
-SERVERCHAN_KEY="$sc_key"
-BARK_KEY="$bark_key"
-BARK_URL="$bark_url"
-WECOM_KEY="$wecom_key"
-DING_TOKEN="$ding_token"
-DING_SECRET="$ding_secret"
-FEISHU_KEY="$feishu_key"
-NOTIFY_CMD='$custom_cmd'
+TG_BOT_TOKEN="$(dq_escape "$tg_token")"
+TG_CHAT_ID="$(dq_escape "$tg_chat")"
+TG_API_BASE="$(dq_escape "$tg_api")"
+SERVERCHAN_KEY="$(dq_escape "$sc_key")"
+BARK_KEY="$(dq_escape "$bark_key")"
+BARK_URL="$(dq_escape "$bark_url")"
+WECOM_KEY="$(dq_escape "$wecom_key")"
+DING_TOKEN="$(dq_escape "$ding_token")"
+DING_SECRET="$(dq_escape "$ding_secret")"
+FEISHU_KEY="$(dq_escape "$feishu_key")"
+NOTIFY_CMD='$(sq_escape "$custom_cmd")'
 BACKEND="$resolved_backend"
 EOF
     )
     chmod 600 "$CONFIG_FILE"
+
+    # 记录初始用量所属周期: 仅在当前周期内生效，跨周期失效；重装幂等不重复计
+    if [ "$initial" -gt 0 ]; then
+        local cstart
+        RESET_DAY="$reset_day"
+        cstart=$(cycle_start)
+        mkdir -p "$STATE_DIR"
+        printf 'initial_cycle=%s\n' "$cstart" > "$META_FILE.tmp" && mv "$META_FILE.tmp" "$META_FILE"
+    fi
 
     # 安装脚本本体与定时任务
     local self
