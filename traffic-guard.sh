@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.6"
+VERSION="1.2.7"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -646,6 +646,26 @@ do_check() {
     esac
 
     if [ "$USED" -ge "$shut_bytes" ]; then
+        # 周期内一次性关机: 已自动关机过就不再重复(用户手动开机说明需要用机,
+        # 且累计用量不会因关机下降, 重复关机只会形成"开机45秒即被关"的死循环);
+        # 改为每日提醒一次, 周期切换后自动重新武装
+        local done_cycle
+        done_cycle=$(sed -n 's/^shutdown_done_cycle=//p' "$STATE_DIR/shutdown-stamp" 2>/dev/null)
+        if [ "$done_cycle" = "$start" ]; then
+            log "已超阈值 $(bytes_to_gb "$USED")GB，但本周期已执行过自动关机，不再重复关机"
+            if [ "$dryrun" -eq 1 ]; then
+                log "[dry-run] 演练模式：将发送每日提醒（不重复关机）"
+                return 0
+            fi
+            local wtoday wlast
+            wtoday=$(date +%F)
+            wlast=$(cat "$WARN_STAMP_FILE" 2>/dev/null)
+            if [ "$wlast" != "$wtoday" ]; then
+                send_notify "traffic-guard 提醒" "流量已超关机阈值 $(bytes_to_gb "$USED")GB/${LIMIT_GB}GB。本周期已自动关机过，不再重复关机；请控制用量或调整配置。"
+                printf '%s\n' "$wtoday" > "$WARN_STAMP_FILE" 2>/dev/null || true
+            fi
+            return 0
+        fi
         log "已用流量达到触发阈值 $(bytes_to_gb "$shut_bytes")GB，执行保护动作: 关机"
         if [ "$dryrun" -eq 1 ]; then
             log "[dry-run] 演练模式：跳过通知与关机。实际运行将立即关机！"
@@ -663,14 +683,17 @@ do_check() {
                 sleep 3
             fi
         fi
+        # 先落盘再关机: poweroff 异步生效, 必须保证重启后能识别"本周期已关机过"
+        printf 'shutdown_done_cycle=%s\n' "$start" > "$STATE_DIR/shutdown-stamp" 2>/dev/null || true
         log "正在执行关机命令..."
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl poweroff
         else
             command -v poweroff >/dev/null 2>&1 && poweroff || shutdown -h now
         fi
-        # 能走到这里说明关机命令未生效（如 LXC 容器无 poweroff 权限），留下明确日志
-        log "警告: 关机命令未生效，下轮检查将重试（通知每 60 分钟最多发送一次）"
+        # 关机命令为异步提交, 走到这里不代表失败; 但容器等环境确实可能不生效,
+        # 下轮检查会重试(通知与关机动作均有节流/一次性保护)
+        log "关机命令已提交（异步生效）。若机器长时间未关机，请检查容器/权限环境"
         return 0
     fi
 

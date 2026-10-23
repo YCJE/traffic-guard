@@ -48,8 +48,9 @@ if [ "$(id -u)" -ne 0 ]; then
     dl "$SELF_URL" "$BOOTSTRAP" || { rm -f "$BOOTSTRAP"; die "下载失败，请检查网络后重试"; }
     bash -n "$BOOTSTRAP" || { rm -f "$BOOTSTRAP"; die "下载脚本校验失败，已中止"; }
     sudo bash "$BOOTSTRAP"
+    rc=$?
     rm -f "$BOOTSTRAP"
-    exit 0
+    exit "$rc"   # 把安装向导的退出码传给调用方, 失败可在脚本中感知
 fi
 
 TMP="$(mktemp /tmp/traffic-guard.XXXXXX)"
