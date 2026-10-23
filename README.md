@@ -55,7 +55,7 @@ sudo ./traffic-guard.sh install
 安装完成后直接输入 `traffic-guard`（等同 `sudo traffic-guard menu`），像 x-ui 一样弹出交互式菜单：
 
 ```
-─────── traffic-guard 管理面板 v1.2.4 ───────
+─────── traffic-guard 管理面板 v1.2.5 ───────
   1. 查看当前用量与状态
   2. 演练检查（dry-run，不会关机）
   3. 立即检查（真实执行，可能触发自动关机！）

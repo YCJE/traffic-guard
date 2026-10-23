@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -341,8 +341,14 @@ proc_usage() {
             else
                 delta_rx=0; delta_tx=0
             fi
-        elif [ "$rebooted" -eq 1 ] || [ "$raw_reset" -eq 1 ]; then
-            delta_rx=$raw_rx; delta_tx=$raw_tx       # 计数器归零（重启/重置），按当前原值累计
+        elif [ "$rebooted" -eq 1 ]; then
+            delta_rx=$raw_rx; delta_tx=$raw_tx       # 重启: 计数器自开机起，全额入账
+        elif [ "$raw_reset" -eq 1 ]; then
+            # 非重启但计数器回落: ALL 模式下最常见原因是 VPN/PPPoE 网卡消失，聚合值
+            # 随之下降。若按"重启"全额入账，剩余网卡的存量计数会被重复累加（多计一倍
+            # 直接导致提前关机）。按 0 增量处理，仅记警告；计数器翻转的罕见场景同此。
+            delta_rx=0; delta_tx=0
+            log "警告: 计数器回落但未检测到重启(接口集变化?)，本轮增量按 0 处理"
         elif [ -n "$s_last_rx" ]; then
             delta_rx=$((raw_rx - s_last_rx))
             delta_tx=$((raw_tx - s_last_tx))
@@ -903,6 +909,16 @@ ask_int() { # ask_int <提示> <默认值> —— 循环直到输入非负整数
     echo "$v"
 }
 
+ask_int_min() { # ask_int_min <最小值> <提示> <默认值> —— 循环直到输入 >= 最小值
+    local min="$1" v
+    while :; do
+        v=$(ask_int "$2" "$3")
+        [ "$v" -ge "$min" ] && break
+        echo "  数值不能小于 $min" >&2
+    done
+    echo "$v"
+}
+
 pkg_install() { # pkg_install <包名>... —— 尽力而为的包安装
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq 2>/dev/null
@@ -1051,9 +1067,9 @@ do_install() {
         esac
     done
 
-    # 2. 计费上限
+    # 2. 计费上限（必须 ≥ 1，否则后续"缓冲 < 上限"永远无法满足，向导会卡死）
     local limit
-    limit=$(ask_int "流量上限多少 GB" 200)
+    limit=$(ask_int_min 1 "流量上限多少 GB" 200)
 
     # 3. 计费口径
     echo "计费口径:"
