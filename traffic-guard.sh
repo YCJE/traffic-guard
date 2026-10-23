@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -519,6 +519,7 @@ load_config() {
     BACKEND=${BACKEND:-auto}
     # 数值兜底: 非法值不致命，恢复默认后继续（防止垃圾值写入 systemd unit）
     case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=60 ;; esac
+    CHECK_INTERVAL=$((10#$CHECK_INTERVAL))
     [ "$CHECK_INTERVAL" -lt 10 ] && CHECK_INTERVAL=10
 
     if [ "$INTERFACE" = "auto" ] || [ -z "$INTERFACE" ]; then
@@ -528,6 +529,11 @@ load_config() {
     case "$MODE" in max|up|down|both) ;; *) die "配置错误: MODE=$MODE（应为 max/up/down/both）" ;; esac
     case "$LIMIT_GB$BUFFER_GB$WARN_GB$RESET_DAY$INITIAL_GB" in ''|*[!0-9]*)
         die "配置错误: LIMIT_GB / BUFFER_GB / WARN_GB / RESET_DAY / INITIAL_GB 必须是非负整数" ;; esac
+    # 手改配置可能写成前导零(如 RESET_DAY=08)，bash 算术按八进制解析会直接报错，
+    # 统一转十进制
+    LIMIT_GB=$((10#$LIMIT_GB)); BUFFER_GB=$((10#$BUFFER_GB))
+    WARN_GB=$((10#$WARN_GB)); RESET_DAY=$((10#$RESET_DAY))
+    INITIAL_GB=$((10#$INITIAL_GB))
     [ "$RESET_DAY" -ge 1 ] && [ "$RESET_DAY" -le 31 ] || die "配置错误: RESET_DAY 应为 1-31"
     [ "$BUFFER_GB" -lt "$LIMIT_GB" ] || die "配置错误: BUFFER_GB 必须小于 LIMIT_GB"
     return 0
@@ -755,6 +761,12 @@ do_upgrade() {
 
 # ---------------------------------------------------------------- 定时监控控制
 
+# cron 守护进程是否在运行；pgrep 缺失时按运行处理，避免误报
+cron_daemon_alive() {
+    command -v pgrep >/dev/null 2>&1 || return 0
+    pgrep -x crond >/dev/null 2>&1 || pgrep -x cron >/dev/null 2>&1
+}
+
 monitor_state() {
     if [ -d /run/systemd/system ]; then
         # is-active 失败时自身已打印 inactive, 再 echo 会输出两遍, 因此捕获后统一输出
@@ -762,7 +774,10 @@ monitor_state() {
         s=$(systemctl is-active "${SERVICE_NAME}.timer" 2>/dev/null)
         echo "${s:-unknown}"
     else
-        if [ -f "/etc/cron.d/${SERVICE_NAME}" ]; then echo active
+        # 文件存在不代表有人执行: 无 cron 守护进程时监控实际是死的
+        if [ -f "/etc/cron.d/${SERVICE_NAME}" ]; then
+            if cron_daemon_alive; then echo active
+            else echo "已安装但 cron 守护进程未运行!"; fi
         elif [ -f "/etc/cron.d/${SERVICE_NAME}.stopped" ]; then echo stopped
         else echo "not-installed"; fi
     fi
@@ -824,7 +839,10 @@ edit_config_menu() {
     if [ -z "$editor" ]; then
         if command -v nano >/dev/null 2>&1; then editor=nano; else editor=vi; fi
     fi
-    "$editor" "$CONFIG_FILE"
+    # EDITOR 可能带参数(如 "code -w")，按空白拆分后执行
+    local -a ed=()
+    read -r -a ed <<< "$editor"
+    "${ed[@]}" "$CONFIG_FILE"
     if ( load_config ) 2>/dev/null; then
         echo "✔ 配置有效"
     else
@@ -1037,7 +1055,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root $INSTALL_PATH check >/dev/null 2>&1
 EOF
         chmod 644 "/etc/cron.d/${SERVICE_NAME}"
-        echo "✔ 已安装 cron 定时任务（每分钟检查一次）"
+        if cron_daemon_alive; then
+            echo "✔ 已安装 cron 定时任务（每分钟检查一次）"
+        else
+            echo "✔ 已写入 cron 任务 /etc/cron.d/${SERVICE_NAME}，但检测不到 cron 守护进程！"
+            echo "  请先安装并启动 cron，否则监控不会运行："
+            echo "    Debian/Ubuntu: apt install -y cron && service cron start"
+            echo "    Alpine:        apk add cronie && rc-service crond start"
+        fi
         [ "$CHECK_INTERVAL" -ne 60 ] && echo "注意: cron 最小粒度为 1 分钟，CHECK_INTERVAL=$CHECK_INTERVAL 将按 60 秒生效"
     fi
 }
