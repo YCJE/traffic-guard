@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -137,6 +137,11 @@ iface_exists() {
     [ -e "/sys/class/net/$1" ]
 }
 
+# 当前系统非 lo 网卡列表，只保留合法网卡名字符，防止异常内核输出注入后续命令
+list_live_ifaces() {
+    ls /sys/class/net 2>/dev/null | grep -v '^lo$' | grep -E '^[A-Za-z0-9._-]+$' || true
+}
+
 # ---------------------------------------------------------------- 后端解析
 
 vnstat_major() {
@@ -222,8 +227,19 @@ vnstat_usage() {
                 iface_exists "$i" 2>/dev/null && echo "$i"
             done)
         fi
-        [ "${#ifaces[@]}" -gt 0 ] || mapfile -t ifaces < <(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+        [ "${#ifaces[@]}" -gt 0 ] || mapfile -t ifaces < <(list_live_ifaces)
         [ "${#ifaces[@]}" -gt 0 ] || return 1
+        # 安装后新增的网卡（PPPoE 重拨的 ppp0、新启的 VPN/docker 网卡等）不会
+        # 自动进 vnstat 库，汇总时会整体漏计其流量——检测出来并明确提示
+        local live ifc2 missing=""
+        mapfile -t live < <(list_live_ifaces)
+        for ifc2 in "${live[@]}"; do
+            case " ${ifaces[*]} " in
+                *" $ifc2 "*) ;;
+                *) missing="$missing $ifc2"; VNSTAT_NOTE=4 ;;
+            esac
+        done
+        [ -n "$missing" ] && VNSTAT_MISSING_IFACES="$missing"
     else
         ifaces=("$INTERFACE")
     fi
@@ -387,6 +403,7 @@ vnstat_note_text() {
         1) echo "vnstat 本周期暂无数据：刚安装后几分钟内属正常（首次写入最长约 5 分钟），随后自动开始累计" ;;
         2) echo "网卡 $INTERFACE 未加入 vnstat 数据库，统计将一直为 0！修复: sudo vnstat --add -i $INTERFACE（或重新运行 traffic-guard install）" ;;
         3) echo "vnstat 数据库读取异常，建议检查 vnstat 服务状态，或将配置中 BACKEND 改为 \"proc\"" ;;
+        4) echo "以下网卡未加入 vnstat 数据库，其流量未被统计:${VNSTAT_MISSING_IFACES}。修复: sudo vnstat --add -i <网卡名> 后重启 vnstat（或重跑 traffic-guard install）" ;;
         *) echo "" ;;
     esac
 }
@@ -395,6 +412,12 @@ vnstat_note_text() {
 
 send_notify() {
     local title="$1" body="$2" ok=""
+    case "$NOTIFY_TYPE" in
+        telegram|serverchan|bark|wecom|dingtalk|feishu)
+            # 极简系统可能未装 curl; 提前给出明确提示而非晦涩的 command not found
+            command -v curl >/dev/null 2>&1 \
+                || { log "通知渠道 $NOTIFY_TYPE 需要 curl，请先安装（如: apt install -y curl）"; return 1; } ;;
+    esac
     # et/eb 为 JSON 转义版；走 curl --data-urlencode 的渠道直接用原文
     local et eb
     et=${title//\\/\\\\}; et=${et//\"/\\\"}
@@ -403,6 +426,7 @@ send_notify() {
         telegram)
             [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || { log "Telegram 未配置完整，跳过通知"; return 1; }
             local tg_base="${TG_API_BASE:-https://api.telegram.org}"
+            tg_base="${tg_base%/}"   # 去尾部斜杠, 避免拼出 //bot 双斜杠 URL 被反代 404
             ok=$(curl -sm 8 "${tg_base}/bot${TG_BOT_TOKEN}/sendMessage" \
                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
                  --data-urlencode "text=${title}
@@ -415,6 +439,7 @@ ${body}" 2>/dev/null) ;;
         bark)
             [ -n "$BARK_KEY" ] || { log "Bark 未配置，跳过通知"; return 1; }
             local bark_url="${BARK_URL:-https://api.day.app}"
+            bark_url="${bark_url%/}"   # 去尾部斜杠, 避免拼出 //push
             ok=$(curl -sm 8 -H 'Content-Type: application/json; charset=utf-8' \
                  -d "{\"device_key\":\"${BARK_KEY}\",\"title\":\"${et}\",\"body\":\"${eb}\",\"group\":\"traffic-guard\"}" \
                  "${bark_url}/push" 2>/dev/null) ;;
@@ -597,7 +622,7 @@ do_check() {
         "(rx=$(bytes_to_gb "$RX") tx=$(bytes_to_gb "$TX") 口径:$(mode_label) 后端:$backend)"
 
     case "$VNSTAT_NOTE" in
-        2|3)
+        2|3|4)
             # 每自然日最多记录一次, 避免每 60 秒刷一条 syslog
             local wtoday wlast
             wtoday=$(date +%F)
@@ -1119,12 +1144,18 @@ do_install() {
             custom_cmd=$(ask "自定义命令（例如: curl -sm5 https://hook.example --data-urlencode \"msg=\$1\"）" "") ;;
         *) notify_type=none ;;
     esac
+    # HTTP 渠道依赖 curl, 缺失时当场提醒而不是等到发通知失败
+    case "$notify_type" in
+        telegram|serverchan|bark|wecom|dingtalk|feishu)
+            command -v curl >/dev/null 2>&1 \
+                || echo "  警告: 系统未安装 curl，该通知渠道将无法发送（请先安装 curl）" ;;
+    esac
 
     # 10. 统计后端
     local backend_note="proc（无需额外依赖）"
     if ensure_vnstat; then
         if [ "$iface" = "ALL" ]; then
-            vnstat_add_iface $(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+            vnstat_add_iface $(list_live_ifaces)
         else
             vnstat_add_iface "$iface"
         fi
