@@ -22,6 +22,11 @@ LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
 log() { echo "[traffic-guard] $*"; }
 die() { echo "[traffic-guard] 错误: $*" >&2; exit 1; }
 
+# 中断(Ctrl-C/断网)时清理临时文件; 预初始化以兼容 set -u
+BOOTSTRAP=""
+TMP=""
+trap 'rm -f "$BOOTSTRAP" "$TMP" 2>/dev/null' EXIT
+
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
     || die "请先安装 curl 或 wget（例如: apt install -y curl）"
 

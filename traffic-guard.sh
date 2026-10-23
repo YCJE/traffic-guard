@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -152,7 +152,8 @@ resolve_backend() {
                 local major; major=$(vnstat_major)
                 if [ -n "$major" ] && [ "$major" -ge 2 ]; then echo vnstat; return; fi
             fi
-            log "警告: 已配置 vnstat 后端但 vnstat 2.x / jq 不可用，降级为 proc 后端"
+            # 不在此处打日志: 本函数每分钟被 check 调用, 后端失效会造成 syslog 刷屏;
+            # 降级事实由 check 日志的"后端:"字段与 status 面板的后端提示呈现
             echo proc; return ;;
     esac
     # auto
@@ -522,6 +523,10 @@ do_status() {
     remain_shut=$(awk -v s="$shut_bytes" -v u="$USED" 'BEGIN { printf "%.2f", (s > u ? s - u : 0) / 1e9 }')
     local note_line=""
     [ -n "$VNSTAT_NOTE" ] && note_line="⚠ 注意     : $(vnstat_note_text)"
+    local backend_hint=""
+    if [ "$BACKEND" = "vnstat" ] && [ "$backend" = "proc" ]; then
+        backend_hint="⚠ 后端提示  : 配置为 vnstat 但当前不可用（vnstat 2.x / jq 缺失），已按 proc 统计"
+    fi
     local pace_line=""
     if [ "$USED" -gt 0 ]; then
         local days_elapsed pace_rate proj_shut
@@ -555,6 +560,7 @@ do_status() {
 剩余可用    : 到上限 $remain_limit GB / 到关机阈值 $remain_shut GB
 $pace_line
 通知方式    : $NOTIFY_TYPE
+$backend_hint
 $note_line
 ====================================================
 提示: 请与服务商面板用量对账；若面板数值明显更高，调大 BUFFER_GB。
@@ -614,9 +620,11 @@ do_check() {
         last_ts=$(cat "$stamp_file" 2>/dev/null)
         case "$last_ts" in ''|*[!0-9]*) last_ts=0 ;; esac
         if [ $((now_ts - last_ts)) -ge 3600 ]; then
-            send_notify "traffic-guard 警告" "本周期流量已达 $(bytes_to_gb "$USED")GB（上限 ${LIMIT_GB}GB），VPS 即将自动关机！"
-            printf '%s\n' "$now_ts" > "$stamp_file" 2>/dev/null || true
-            sleep 3
+            # 仅发送成功才记录节流时间戳: 失败时下轮重试, 避免通知在关机前永远丢失
+            if send_notify "traffic-guard 警告" "本周期流量已达 $(bytes_to_gb "$USED")GB（上限 ${LIMIT_GB}GB），VPS 即将自动关机！"; then
+                printf '%s\n' "$now_ts" > "$stamp_file" 2>/dev/null || true
+                sleep 3
+            fi
         fi
         log "正在执行关机命令..."
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -694,6 +702,8 @@ do_upgrade() {
     local url="${TG_RAW_URL:-https://raw.githubusercontent.com/YCJE/traffic-guard/main/traffic-guard.sh}"
     local tmp="$INSTALL_PATH.new" newver
     mkdir -p "$(dirname "$INSTALL_PATH")" 2>/dev/null
+    # 下载/校验过程中断(Ctrl-C/断网超时)时清理半成品文件
+    trap 'rm -f "$tmp" 2>/dev/null' EXIT
     echo "正在获取最新版本: $url"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL -m 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "下载失败，请检查网络后重试"; }
@@ -900,9 +910,28 @@ ensure_vnstat() {
         if [ -n "$major" ] && [ "$major" -ge 2 ]; then
             if [ -d /run/systemd/system ]; then
                 systemctl enable --now vnstat >/dev/null 2>&1 || true
-                # 确认守护进程真的在跑，没跑就再拉一次
+                # 确认守护进程真的在跑；没跑就再拉一次，仍失败则降级 proc，
+                # 否则数据库永远为空，监控会静默按 0 计一整个周期
                 systemctl is-active --quiet vnstat 2>/dev/null || \
                     systemctl restart vnstat >/dev/null 2>&1 || true
+                systemctl is-active --quiet vnstat 2>/dev/null || {
+                    echo "警告: vnstat 守护进程无法启动，改用 proc 后端。"
+                    return 1
+                }
+            else
+                # 非 systemd 系统(Alpine/OpenRC/老系统): 手动拉起守护进程
+                service vnstat start >/dev/null 2>&1 \
+                    || rc-service vnstat start >/dev/null 2>&1 \
+                    || vnstatd -d >/dev/null 2>&1 \
+                    || true
+                # pgrep 缺失时无法验证，保守起见不降级（空库场景由每日一次的
+                # 后端警告提示），可验证时确认失败才降级
+                if command -v pgrep >/dev/null 2>&1; then
+                    pgrep -x vnstatd >/dev/null 2>&1 || {
+                        echo "警告: 无法启动 vnstatd 守护进程，改用 proc 后端。"
+                        return 1
+                    }
+                fi
             fi
             return 0
         fi
@@ -913,12 +942,18 @@ ensure_vnstat() {
 
 vnstat_add_iface() {
     command -v vnstat >/dev/null 2>&1 || return 1
-    local ifc try total=0 added=0
+    local ifc try out total=0 added=0
     for ifc in "$@"; do
         total=$((total + 1))
         for try in 1 2 3; do
             # 失败常见于守护进程刚启动时数据库被占用，等待后重试
-            if vnstat --add -i "$ifc" >/dev/null 2>&1; then added=$((added + 1)); break; fi
+            out=$(vnstat --add -i "$ifc" 2>&1)
+            if [ $? -eq 0 ]; then added=$((added + 1)); break; fi
+            # 重装场景: 接口已在库中时 vnstat 2.x 仍返回非零，视为成功
+            case "$out" in
+                *"lready existing"*|*"lready monitoring"*|*"lready in database"*)
+                    added=$((added + 1)); break ;;
+            esac
             sleep 2
         done
     done
