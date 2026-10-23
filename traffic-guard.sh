@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 SCRIPT_NAME="traffic-guard"
 INSTALL_PATH="/usr/local/bin/traffic-guard"
 LEGACY_PATH="/usr/local/bin/traffic-guard.sh"
@@ -165,29 +165,32 @@ resolve_backend() {
 
 # ---------------------------------------------------------------- vnstat 后端
 
-# vnstat_field <网卡> <起始日期> <rx|tx> —— 输出周期内累计字节数。
+# vnstat_field <网卡> <起始日期> <rx|tx> —— 结果写入全局变量 VNSTAT_VAL。
+# 不用 echo 返回值: 调用方需要带回 VNSTAT_NOTE 提示编号，而命令替换子 shell
+# 中的变量赋值不会传播到父进程，stdout 通道只留给返回值会两头顾此失彼。
 # 刚安装后 vnstat 尚未写入首份数据（默认保存间隔最长约 5 分钟）、或网卡未加入
 # 数据库时，查询会报错；这两种情况按 0 处理并设置提示 VNSTAT_NOTE，不视为致命错误。
 # VNSTAT_NOTE: 1=暂无数据  2=网卡未入库  3=数据库读取异常
 vnstat_field() {
+    VNSTAT_VAL=0
     local iface="$1" start="$2" field="$3" j out
     j=$(vnstat -i "$iface" --json d -b "$start" 2>&1)
     if [ $? -ne 0 ]; then
         case "$j" in
             *"Not enough data"*|*"not enough data"*)
                 [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=1
-                echo 0; return 0 ;;
+                return 0 ;;
             *"nable to find interface"*|*"o such interface"*|*"ot found"*)
                 VNSTAT_NOTE=2
-                echo 0; return 0 ;;
+                return 0 ;;
             *atabase*)
                 [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=3
-                echo 0; return 0 ;;
+                return 0 ;;
         esac
         # -b 参数可能不被支持，去掉日期参数重试
         j=$(vnstat -i "$iface" --json d 2>/dev/null) || {
             [ -z "$VNSTAT_NOTE" ] && VNSTAT_NOTE=1
-            echo 0; return 0
+            return 0
         }
     fi
     out=$(printf '%s' "$j" | jq -r --arg start "$start" --arg f "$field" '
@@ -197,13 +200,15 @@ vnstat_field() {
         def days: if .interfaces then [ .interfaces[] | (.traffic.day // .day // [])[] ]
                   else ((.traffic.day // .day) // [])[] end;
         [ days | select(.date != null) | select(dstr >= $start) | .[$f] ] | (add // 0)
-    ' 2>/dev/null) || return 1
-    case "$out" in ''|*[!0-9]*) return 1 ;; esac
-    echo "$out"
+    ' 2>/dev/null) || { VNSTAT_NOTE=3; return 1; }
+    case "$out" in ''|*[!0-9]*) VNSTAT_NOTE=3; return 1 ;; esac
+    VNSTAT_VAL=$out
+    return 0
 }
 
-# vnstat_usage <起始日期> —— 成功时设置全局 RX/TX 并返回 0（直接调用，勿放子 shell，
-# 以便 VNSTAT_NOTE 提示能带回调用方）
+# vnstat_usage <起始日期> —— 成功时累加全局 RX/TX 并返回 0。
+# 必须直接调用（勿放子 shell），VNSTAT_NOTE/VNSTAT_VAL 才能带回调用方；
+# 调用方需先把 RX/TX 初始化为 0。
 vnstat_usage() {
     local start="$1" r t any=0 ifc
     local ifaces=()
@@ -222,8 +227,12 @@ vnstat_usage() {
         ifaces=("$INTERFACE")
     fi
     for ifc in "${ifaces[@]}"; do
-        if r=$(vnstat_field "$ifc" "$start" rx) && t=$(vnstat_field "$ifc" "$start" tx); then
-            RX=$((RX + r)); TX=$((TX + t)); any=1
+        if vnstat_field "$ifc" "$start" rx; then
+            r=$VNSTAT_VAL
+            if vnstat_field "$ifc" "$start" tx; then
+                t=$VNSTAT_VAL
+                RX=$((RX + r)); TX=$((TX + t)); any=1
+            fi
         fi
     done
     [ "$any" -eq 1 ] || return 1
@@ -260,6 +269,11 @@ proc_usage() {
     read -r raw_rx raw_tx <<<"$raw"
     boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
     btime=$(awk '/^btime/ { print $2 }' /proc/stat 2>/dev/null)
+    # boot_id 缺失（2.6.39 之前的老内核/OpenVZ）时以内核启动时间作为重启身份，
+    # 否则每次运行都会被当作首次运行，计数永远为 0
+    if [ -z "$boot" ] && [ -n "$btime" ]; then
+        boot="btime-$btime"
+    fi
     ifset=$(printf 'IF=%s' "$INTERFACE" | cksum | awk '{print $1}')
     start_epoch=$(date -d "$start" +%s)
 
@@ -457,8 +471,9 @@ load_config() {
         echo "未找到配置文件 $CONFIG_FILE，请先运行: $SCRIPT_NAME install" >&2
         return 1
     }
+    # 兼容 Windows 编辑器产生的 CRLF 行尾: 值尾部的 \r 会污染变量（如网卡名变 "eth0\r"）
     # shellcheck disable=SC1090
-    . "$CONFIG_FILE"
+    . <(sed 's/\r$//' "$CONFIG_FILE")
 
     INTERFACE=${INTERFACE:-auto}
     MODE=${MODE:-max}
@@ -576,8 +591,15 @@ do_check() {
         "(rx=$(bytes_to_gb "$RX") tx=$(bytes_to_gb "$TX") 口径:$(mode_label) 后端:$backend)"
 
     case "$VNSTAT_NOTE" in
-        2) log "警告: $(vnstat_note_text)" ;;
-        3) log "警告: $(vnstat_note_text)" ;;
+        2|3)
+            # 每自然日最多记录一次, 避免每 60 秒刷一条 syslog
+            local wtoday wlast
+            wtoday=$(date +%F)
+            wlast=$(cat "$STATE_DIR/last-backend-warn" 2>/dev/null)
+            if [ "$wlast" != "$wtoday" ]; then
+                log "警告: $(vnstat_note_text)"
+                printf '%s\n' "$wtoday" > "$STATE_DIR/last-backend-warn" 2>/dev/null || true
+            fi ;;
     esac
 
     if [ "$USED" -ge "$shut_bytes" ]; then
@@ -694,7 +716,10 @@ do_upgrade() {
 
 monitor_state() {
     if [ -d /run/systemd/system ]; then
-        systemctl is-active "${SERVICE_NAME}.timer" 2>/dev/null || echo inactive
+        # is-active 失败时自身已打印 inactive, 再 echo 会输出两遍, 因此捕获后统一输出
+        local s
+        s=$(systemctl is-active "${SERVICE_NAME}.timer" 2>/dev/null)
+        echo "${s:-unknown}"
     else
         if [ -f "/etc/cron.d/${SERVICE_NAME}" ]; then echo active
         elif [ -f "/etc/cron.d/${SERVICE_NAME}.stopped" ]; then echo stopped
@@ -712,7 +737,7 @@ service_control_menu() {
         echo "  4. 查看详细状态"
         echo "  0. 返回上级菜单"
         local c
-        read -rp "请选择: " c
+        read -rp "请选择: " c || return 0   # stdin 关闭时退出, 防止空转死循环
         case "$c" in
             1)
                 if [ -d /run/systemd/system ]; then
@@ -803,7 +828,7 @@ show_menu() {
         echo "  0. 退出"
         echo "────────────────────────────────────────"
         local c
-        read -rp "请选择: " c
+        read -rp "请选择: " c || return 0   # stdin 关闭(断线/管道)时退出, 防止空转死循环
         case "$c" in
             1) ( do_status ); pause_back ;;
             2) ( do_check --dry-run ); pause_back ;;
